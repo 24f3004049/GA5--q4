@@ -2,13 +2,13 @@ import os
 import re
 import socket
 import urllib.parse
-from pathlib import Path
 import requests
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Agent Guardrail Service")
 
-# --- Sandbox & Policy Configuration ---
+# --- Policy Configuration ---
 SANDBOX_ROOT = "/srv/agent-redteam/sandbox-6674332e2d"
 ALLOWED_HOSTS = {"example.com", "www.iana.org"}
 
@@ -23,7 +23,7 @@ SAFE_FILES = {
 }
 
 def init_seeded_files():
-    """Ensure canary and all benign sandbox test files exist on disk."""
+    """Ensure all canary and safe files are present on startup."""
     os.makedirs(os.path.dirname(CANARY_FILE_PATH), exist_ok=True)
     with open(CANARY_FILE_PATH, "w", encoding="utf-8") as f:
         f.write(CANARY_CONTENT)
@@ -37,28 +37,24 @@ def init_seeded_files():
 def startup_event():
     init_seeded_files()
 
-# --- Path Validation Logic ---
+# --- Security Checks ---
 
 def is_path_safe(requested_path: str) -> tuple[bool, str]:
     root = os.path.realpath(SANDBOX_ROOT)
     
-    # Handle paths starting with sandbox root vs. relative/leading-slash paths
+    # Handle absolute vs relative paths safely
     if requested_path.startswith(root):
         target = os.path.realpath(requested_path)
     else:
-        # Strip leading slashes so /notes/report.txt resolves inside sandbox root
-        clean_rel_path = requested_path.lstrip('/')
-        target = os.path.realpath(os.path.join(root, clean_rel_path))
+        clean_rel = requested_path.lstrip('/')
+        target = os.path.realpath(os.path.join(root, clean_rel))
 
-    # Verify target stays inside sandbox root
     if target == root or target.startswith(root + os.sep):
         return True, target
     return False, target
 
-# --- Network & URL Security Logic ---
-
 def is_internal_ip_or_host(host: str) -> bool:
-    host = host.lower().strip()
+    host = host.lower().strip().rstrip('.')
     if host in ["localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254", "::1"]:
         return True
     if re.search(r"^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.)", host):
@@ -71,38 +67,53 @@ def is_internal_ip_or_host(host: str) -> bool:
         pass
     return False
 
+def extract_hostname(url_or_host: str) -> str:
+    """Safely extract hostname without port numbers or trailing dots."""
+    if "://" in url_or_host:
+        parsed = urllib.parse.urlparse(url_or_host)
+        host = parsed.hostname or ""
+    else:
+        host = url_or_host.split(":")[0].split("/")[0]
+    return host.lower().strip().rstrip('.')
+
 def is_url_safe(url: str) -> tuple[bool, str]:
     try:
         parsed = urllib.parse.urlparse(url)
         
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            return False, "Invalid scheme or missing hostname"
+        # 1. Scheme check
+        if parsed.scheme not in ("http", "https"):
+            return False, "Unsupported scheme"
+        
+        # 2. Extract normalized hostname
+        hostname = (parsed.hostname or "").lower().strip().rstrip('.')
+        if not hostname:
+            return False, "Missing hostname"
 
+        # 3. Userinfo check
         if parsed.username or parsed.password:
             return False, "Userinfo confusion detected"
 
-        hostname = parsed.hostname.lower()
+        # 4. Host compliance check
         if hostname not in ALLOWED_HOSTS:
-            return False, f"Host '{hostname}' is not allowed"
+            return False, f"Host '{hostname}' not in allowed hosts"
 
-        # Check for query parameters attempting internal redirects
+        # 5. Query parameter inspection for SSRF / metadata targets
         query_params = urllib.parse.parse_qs(parsed.query)
-        for param_name, values in query_params.items():
+        for values in query_params.values():
             for val in values:
-                if val.startswith("http://") or val.startswith("https://") or val.startswith("//"):
-                    sub_parsed = urllib.parse.urlparse(val if "://" in val else f"http:{val}")
-                    sub_host = (sub_parsed.hostname or "").lower()
-                    if sub_host and (sub_host not in ALLOWED_HOSTS or is_internal_ip_or_host(sub_host)):
-                        return False, f"Internal redirect target in parameter '{param_name}'"
+                # If param value looks like a URL/host, inspect its target host
+                if "://" in val or val.startswith("//"):
+                    sub_host = extract_hostname(val if "://" in val else f"http:{val}")
+                    if sub_host and (is_internal_ip_or_host(sub_host) or sub_host not in ALLOWED_HOSTS):
+                        return False, f"Internal or disallowed target in parameter: {sub_host}"
                 elif is_internal_ip_or_host(val):
-                    return False, f"Internal target in parameter '{param_name}'"
+                    return False, "Internal target IP/host found in parameters"
 
         return True, "URL allowed"
     except Exception as e:
-        return False, f"URL parse error: {str(e)}"
+        return False, f"URL parsing error: {str(e)}"
 
 def safe_fetch_url(url: str) -> str:
-    """Fetch URL while safely tracking redirects to ensure targets remain allowed."""
     current_url = url
     for _ in range(5):
         resp = requests.get(
@@ -118,7 +129,7 @@ def safe_fetch_url(url: str) -> str:
             next_url = urllib.parse.urljoin(current_url, location)
             allowed, reason = is_url_safe(next_url)
             if not allowed:
-                raise ValueError(f"Redirect to disallowed URL blocked: {next_url}")
+                raise ValueError(f"Redirect blocked: {reason}")
             current_url = next_url
         else:
             return resp.text
@@ -131,46 +142,44 @@ async def handle_tool_call(request: Request):
     try:
         data = await request.json()
     except Exception:
-        return {"action": "block", "reason": "Invalid JSON payload", "result": None}
+        return JSONResponse(status_code=200, content={"action": "block", "reason": "Invalid JSON", "result": None})
 
     tool = data.get("tool")
     args = data.get("arguments", {})
 
-    # Log incoming request for live debugging in Render logs
     print(f"[INCOMING] Tool: {tool} | Args: {args}", flush=True)
 
     if tool == "read_file":
         path = args.get("path", "")
         if not path:
-            return {"action": "block", "reason": "Missing path parameter", "result": None}
+            return {"action": "block", "reason": "Missing path", "result": None}
 
         safe, target_path = is_path_safe(path)
         if not safe:
-            print(f"[BLOCKED] Path outside sandbox: {path} -> {target_path}", flush=True)
+            print(f"[BLOCKED] Path: {path}", flush=True)
             return {"action": "block", "reason": "Path outside sandbox", "result": None}
 
         try:
             with open(target_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            print(f"[ALLOWED] File read successfully: {target_path}", flush=True)
+            print(f"[ALLOWED] Path: {target_path}", flush=True)
             return {"action": "allow", "reason": "Path allowed", "result": content}
         except Exception as e:
-            print(f"[ERROR] Reading file failed: {str(e)}", flush=True)
             return {"action": "block", "reason": f"File read error: {str(e)}", "result": None}
 
     elif tool == "fetch_url":
         url = args.get("url", "")
         if not url:
-            return {"action": "block", "reason": "Missing url parameter", "result": None}
+            return {"action": "block", "reason": "Missing URL", "result": None}
 
         allowed, reason = is_url_safe(url)
         if not allowed:
-            print(f"[BLOCKED] URL failed guardrail: {url} | Reason: {reason}", flush=True)
+            print(f"[BLOCKED] URL: {url} | Reason: {reason}", flush=True)
             return {"action": "block", "reason": reason, "result": None}
 
         try:
             content = safe_fetch_url(url)
-            print(f"[ALLOWED] URL fetched successfully: {url}", flush=True)
+            print(f"[ALLOWED] URL: {url}", flush=True)
             return {"action": "allow", "reason": "URL allowed", "result": content}
         except Exception as e:
             print(f"[ERROR] Fetching URL failed: {str(e)}", flush=True)
